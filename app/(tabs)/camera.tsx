@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   StyleSheet,
@@ -7,10 +7,18 @@ import {
   Alert,
   FlatList,
   TouchableOpacity,
+  LayoutChangeEvent,
 } from 'react-native';
 import { CameraView, CameraType, useCameraPermissions } from 'expo-camera';
-import Svg, { Path } from 'react-native-svg';
+import { Gyroscope } from 'expo-sensors';
+import Svg, { G, Path } from 'react-native-svg';
 import { useSavedDrawings } from '../../hooks/useSavedDrawings';
+import {
+  createPhysicsState,
+  makeFloaterBody,
+  resetPhysicsState,
+  stepPhysics,
+} from '../../lib/floaterPhysics';
 
 interface PathData {
   d: string;
@@ -19,40 +27,141 @@ interface PathData {
 }
 
 interface SavedDrawing {
+  id?: string;
   name: string;
   paths: PathData[];
+  canvas_width?: number;
+  canvas_height?: number;
+}
+
+const LAG_PERCENT = 60;
+const GYRO_TO_INPUT = 24;
+const GYRO_LOG_GAIN = 0.22;
+const GYRO_MAX_VIEW_VEL = 14;
+const GYRO_DEADZONE = 0.05;
+
+function mapGyroRateToViewVelocity(rate: number) {
+  if (Math.abs(rate) < GYRO_DEADZONE) {
+    return 0;
+  }
+  const scaled = rate * GYRO_TO_INPUT;
+  const magnitude = Math.abs(scaled);
+  const compressed = Math.log1p(magnitude * GYRO_LOG_GAIN) / GYRO_LOG_GAIN;
+  return Math.sign(scaled) * Math.min(compressed, GYRO_MAX_VIEW_VEL);
 }
 
 export default function CameraScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const { savedDrawings, loadSavedDrawings } = useSavedDrawings();
-  const [selectedDrawing, setSelectedDrawing] = useState<PathData[]>([]);
-  const [showList, setShowList] = useState(false); // Start minimized
-  const selectedDrawingId = useRef<string | null>(null); // Track selected drawing ID
+  const [selectedDrawing, setSelectedDrawing] = useState<SavedDrawing | null>(null);
+  const [showList, setShowList] = useState(false);
+  const [overlaySize, setOverlaySize] = useState({ width: 0, height: 0 });
+  const [floaterOffset, setFloaterOffset] = useState({ x: 0, y: 0 });
+  const selectedDrawingId = useRef<string | null>(null);
+  const physicsStateRef = useRef(createPhysicsState());
+  const rafRef = useRef<number | null>(null);
+  const lastFrameMsRef = useRef<number | null>(null);
 
-  // Reload drawings periodically to sync with index.tsx
   useEffect(() => {
     const interval = setInterval(() => {
-      loadSavedDrawings(); // Refresh saved drawings
-    }, 5000); // Increased to 5 seconds to reduce overhead
+      loadSavedDrawings();
+    }, 5000);
     return () => clearInterval(interval);
   }, [loadSavedDrawings]);
 
-  // Update selectedDrawing only if it matches the current selectedDrawingId
   useEffect(() => {
     if (selectedDrawingId.current) {
-      const selected = savedDrawings.find(drawing => drawing.name === selectedDrawingId.current);
-      if (selected && selected.paths !== selectedDrawing) {
-        setSelectedDrawing(selected.paths);
+      const selected = savedDrawings.find(
+        (drawing) => drawing.id === selectedDrawingId.current || drawing.name === selectedDrawingId.current,
+      );
+      if (selected) {
+        setSelectedDrawing(selected);
       }
     }
   }, [savedDrawings]);
 
+  useEffect(() => {
+    const state = physicsStateRef.current;
+    state.floaters = [makeFloaterBody()];
+    resetPhysicsState(state);
+    setFloaterOffset({ x: 0, y: 0 });
+  }, [selectedDrawing?.id]);
+
+  useEffect(() => {
+    Gyroscope.setUpdateInterval(16);
+    const subscription = Gyroscope.addListener((reading) => {
+      const state = physicsStateRef.current;
+      state.rawViewVel.x = mapGyroRateToViewVelocity(reading.y);
+      state.rawViewVel.y = mapGyroRateToViewVelocity(-reading.x);
+    });
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    const tick = (nowMs: number) => {
+      const state = physicsStateRef.current;
+      const prev = lastFrameMsRef.current ?? nowMs;
+      const dt = Math.min(0.03, (nowMs - prev) / 1000);
+      lastFrameMsRef.current = nowMs;
+      stepPhysics(state, LAG_PERCENT, dt, nowMs / 1000);
+
+      const floater = state.floaters[0];
+      if (floater) {
+        setFloaterOffset({ x: floater.offset.x, y: floater.offset.y });
+      }
+
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+      }
+      lastFrameMsRef.current = null;
+    };
+  }, []);
+
   const selectDrawing = (drawing: SavedDrawing) => {
-    setSelectedDrawing(drawing.paths);
-    selectedDrawingId.current = drawing.name; // Store selected drawing ID
+    setSelectedDrawing(drawing);
+    selectedDrawingId.current = drawing.id ?? drawing.name;
     Alert.alert('Success', `Loaded "${drawing.name}"`);
   };
+
+  const onOverlayLayout = (event: LayoutChangeEvent) => {
+    const { width, height } = event.nativeEvent.layout;
+    setOverlaySize({ width, height });
+  };
+
+  const drawingMetrics = useMemo(() => {
+    const drawingWidth = selectedDrawing?.canvas_width ?? overlaySize.width;
+    const drawingHeight = selectedDrawing?.canvas_height ?? overlaySize.height;
+    const safeDrawingWidth = Math.max(1, drawingWidth);
+    const safeDrawingHeight = Math.max(1, drawingHeight);
+    const scale = Math.min(
+      overlaySize.width / safeDrawingWidth || 1,
+      overlaySize.height / safeDrawingHeight || 1,
+    );
+    return {
+      drawingWidth: safeDrawingWidth,
+      drawingHeight: safeDrawingHeight,
+      scale,
+    };
+  }, [overlaySize.height, overlaySize.width, selectedDrawing?.canvas_height, selectedDrawing?.canvas_width]);
+
+  const overlayTransform = useMemo(
+    () =>
+      `translate(${overlaySize.width / 2 + floaterOffset.x}, ${overlaySize.height / 2 + floaterOffset.y}) scale(${drawingMetrics.scale || 1}) translate(${-drawingMetrics.drawingWidth / 2}, ${-drawingMetrics.drawingHeight / 2})`,
+    [
+      drawingMetrics.drawingHeight,
+      drawingMetrics.drawingWidth,
+      drawingMetrics.scale,
+      floaterOffset.x,
+      floaterOffset.y,
+      overlaySize.height,
+      overlaySize.width,
+    ],
+  );
 
   if (!permission) {
     return <Text>Loading permissions...</Text>;
@@ -69,17 +178,19 @@ export default function CameraScreen() {
   return (
     <View style={styles.container}>
       <CameraView style={styles.camera} facing={'back' as CameraType} />
-      <Svg style={styles.canvas}>
-        {selectedDrawing.map((path, index) => (
-          <Path
-            key={index}
-            d={path.d}
-            stroke="rgba(0, 0, 0, 0.5)"
-            strokeWidth={path.strokeWidth}
-            fill="none"
-            opacity={path.opacity}
-          />
-        ))}
+      <Svg style={styles.canvas} onLayout={onOverlayLayout}>
+        <G transform={overlayTransform}>
+          {(selectedDrawing?.paths ?? []).map((path, index) => (
+            <Path
+              key={index}
+              d={path.d}
+              stroke="rgba(0, 0, 0, 0.5)"
+              strokeWidth={path.strokeWidth}
+              fill="none"
+              opacity={path.opacity}
+            />
+          ))}
+        </G>
       </Svg>
       <TouchableOpacity
         style={styles.toggleButton}
@@ -92,7 +203,7 @@ export default function CameraScreen() {
       {showList && (
         <FlatList
           data={savedDrawings}
-          keyExtractor={(item, index) => index.toString()}
+          keyExtractor={(item, index) => item.id ?? `${item.name}-${index}`}
           renderItem={({ item }) => (
             <TouchableOpacity onPress={() => selectDrawing(item)} style={styles.listItem}>
               <Text>{item.name}</Text>
